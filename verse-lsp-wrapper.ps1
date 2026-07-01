@@ -228,49 +228,67 @@ while ($true) {
     }
 
     $bodyBytes = $msg.Body
+    $forwarded = $false
 
-    if (-not $initInjected) {
-        try {
-            $jsonText = [System.Text.Encoding]::UTF8.GetString($bodyBytes)
-            $obj = $jsonText | ConvertFrom-Json
+    try {
+        $jsonText = [System.Text.Encoding]::UTF8.GetString($bodyBytes)
+        $obj = $jsonText | ConvertFrom-Json
 
-            if ($obj.method -eq 'initialize') {
-                $initInjected = $true
-                Write-Log "Intercepted initialize. rootUri=$($obj.params.rootUri)"
+        if (-not $initInjected -and $obj.method -eq 'initialize') {
+            $initInjected = $true
+            Write-Log "Intercepted initialize. rootUri=$($obj.params.rootUri)"
 
-                # Resolve project root
-                $rootUri  = $obj.params.rootUri
-                $startDir = if ($rootUri) { ConvertFrom-FileUri $rootUri } else { (Get-Location).Path }
-                Write-Log "Walking up from: $startDir"
+            # Resolve project root
+            $rootUri  = $obj.params.rootUri
+            $startDir = if ($rootUri) { ConvertFrom-FileUri $rootUri } else { (Get-Location).Path }
+            Write-Log "Walking up from: $startDir"
 
-                $vprojectFile = Find-VProjectFile $startDir
-                if ($vprojectFile) {
-                    $folders = @(Build-WorkspaceFolders $vprojectFile)
+            $vprojectFile = Find-VProjectFile $startDir
+            if ($vprojectFile) {
+                $folders = @(Build-WorkspaceFolders $vprojectFile)
 
-                    # Replace workspaceFolders in params
-                    if ($obj.params | Get-Member workspaceFolders -ErrorAction SilentlyContinue) {
-                        $obj.params.workspaceFolders = $folders
-                    } else {
-                        $obj.params | Add-Member -NotePropertyName workspaceFolders -NotePropertyValue $folders
-                    }
-
-                    $newJson   = $obj | ConvertTo-Json -Depth 20 -Compress
-                    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($newJson)
-                    Write-Log "Injected $($folders.Count) workspace folders into initialize"
+                # Replace workspaceFolders in params
+                if ($obj.params | Get-Member workspaceFolders -ErrorAction SilentlyContinue) {
+                    $obj.params.workspaceFolders = $folders
                 } else {
-                    Write-Log "No vproject found — forwarding initialize unchanged"
+                    $obj.params | Add-Member -NotePropertyName workspaceFolders -NotePropertyValue $folders
                 }
+
+                $newJson   = $obj | ConvertTo-Json -Depth 20 -Compress
+                $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($newJson)
+                Write-Log "Injected $($folders.Count) workspace folders into initialize"
+            } else {
+                Write-Log "No vproject found — forwarding initialize unchanged"
             }
-        } catch {
-            Write-Log "Error processing message: $_"
+
+        } elseif ($obj.method -eq 'shutdown') {
+            # Forward shutdown to verse-lsp, then immediately ack Helix so it
+            # doesn't wait for a response verse-lsp will never send.
+            Send-LspMessage $childIn $bodyBytes
+            $forwarded = $true
+            $ackJson   = "{`"jsonrpc`":`"2.0`",`"id`":$($obj.id),`"result`":null}"
+            $ackBytes  = [System.Text.Encoding]::UTF8.GetBytes($ackJson)
+            Send-LspMessage $helixOut $ackBytes
+            Write-Log "Forwarded shutdown and sent immediate ack to Helix (id=$($obj.id))"
+
+        } elseif ($obj.method -eq 'exit') {
+            # Forward exit then terminate immediately — no point waiting for verse-lsp.
+            Send-LspMessage $childIn $bodyBytes
+            $forwarded = $true
+            Write-Log "Received exit notification — terminating"
+            break
         }
+    } catch {
+        Write-Log "Error processing message: $_"
     }
 
-    Send-LspMessage $childIn $bodyBytes
+    if (-not $forwarded) {
+        Send-LspMessage $childIn $bodyBytes
+    }
 }
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 
 try { $childIn.Close() } catch {}
-[void]$child.WaitForExit(5000)
-Write-Log "verse-lsp-wrapper exiting (child exit code=$($child.ExitCode))"
+try { if (-not $child.HasExited) { $child.Kill() } } catch {}
+Write-Log "verse-lsp-wrapper exiting"
