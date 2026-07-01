@@ -15,7 +15,7 @@ scope = "source.verse"
 injection-regex = "verse"
 file-types = ["verse", "versetest", "vson"]
 comment-token = "#"
-block-comment-tokens = { open = "<#", close = "#>" }
+block-comment-tokens = { start = "<#", end = "#>" }
 language-servers = ["verse-lsp"]
 indent = { tab-width = 4, unit = "    " }
 
