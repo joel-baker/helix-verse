@@ -17,6 +17,7 @@ file-types = ["verse", "versetest", "vson"]
 comment-token = "#"
 block-comment-tokens = { start = "<#", end = "#>" }
 language-servers = ["verse-lsp"]
+roots = [".uefnproject", ".uplugin"]
 indent = { tab-width = 4, unit = "    " }
 
 [[grammar]]
