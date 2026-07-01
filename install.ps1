@@ -135,6 +135,11 @@ Write-Host "Configuring languages.toml..." -ForegroundColor White
 
 $SourceToml = Get-Content -Path (Join-Path $RepoRoot 'languages.toml') -Raw
 
+# Substitute wrapper script path
+$WrapperDest      = Join-Path $HelixConfig 'verse-lsp-wrapper.ps1'
+$WrapperEscaped   = $WrapperDest -replace '\\', '\\'
+$SourceToml       = $SourceToml -replace '__WRAPPER_PATH__', $WrapperEscaped
+
 # Substitute verse-lsp.exe path (TOML strings require backslashes escaped as \\)
 if ($null -ne $VerseLspPath) {
     $TomlEscapedPath = $VerseLspPath -replace '\\', '\\'
@@ -209,6 +214,19 @@ if (-not ($SkipToml -eq $true)) {
     }
     Write-Success "languages.toml updated: $UserToml"
 }
+
+# ─────────────────────────────────────────────
+# Copy LSP wrapper script
+# ─────────────────────────────────────────────
+
+Write-Host ""
+Write-Host "Installing LSP wrapper..." -ForegroundColor White
+
+$WrapperSrc  = Join-Path $RepoRoot 'verse-lsp-wrapper.ps1'
+$WrapperDest = Join-Path $HelixConfig 'verse-lsp-wrapper.ps1'
+Write-Step "Copying to $WrapperDest"
+Copy-Item -Path $WrapperSrc -Destination $WrapperDest -Force
+Write-Success "LSP wrapper installed"
 
 # ─────────────────────────────────────────────
 # Copy query files
