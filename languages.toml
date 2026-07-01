@@ -1,0 +1,24 @@
+# Helix editor language configuration for Verse (Epic Games / UEFN)
+#
+# Installation: run install.ps1 (auto-detects verse-lsp.exe path),
+# or manually merge this file into %APPDATA%\helix\languages.toml.
+#
+# Update the command below to point to verse-lsp.exe from your VS Code Verse extension:
+#   %USERPROFILE%\.vscode\extensions\epicgames.verse-*\bin\Win64\verse-lsp.exe
+
+[language-server.verse-lsp]
+command = "__VERSE_LSP_PATH__"
+
+[[language]]
+name = "verse"
+scope = "source.verse"
+injection-regex = "verse"
+file-types = ["verse", "versetest", "vson"]
+comment-token = "#"
+block-comment-tokens = { open = "<#", close = "#>" }
+language-servers = ["verse-lsp"]
+indent = { tab-width = 4, unit = "    " }
+
+[[grammar]]
+name = "verse"
+source = { git = "https://github.com/taku25/tree-sitter-verse", rev = "6b5433e37b52c03c4c07f9468bf7cc11e45f2f82" }
