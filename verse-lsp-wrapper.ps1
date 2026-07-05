@@ -291,24 +291,20 @@ function Invoke-ProjectSwapIfNeeded {
     $fileDir = [IO.Path]::GetDirectoryName($docPath)
     if (-not $fileDir) { return }
 
-    # Resolve vproject — use cache for previously-seen directories (positive results only).
+    # Resolve vproject — cache all results including $null to avoid filesystem
+    # walks on every hover/completion event (hot path after this fix).
     if ($script:projectCache.ContainsKey($fileDir)) {
         $vprojectFile = $script:projectCache[$fileDir]
     } else {
         $vprojectFile = Find-VProjectFile $fileDir
-        if ($vprojectFile) {
-            $script:projectCache[$fileDir] = $vprojectFile
-        }
-        # $null results are NOT cached so future opens re-check (e.g. after first UEFN run).
+        $script:projectCache[$fileDir] = $vprojectFile  # cache $null too
     }
 
     if (-not $vprojectFile) {
-        Write-Log "No vproject found for $fileDir — keeping existing workspace folders"
         return
     }
 
     if ($vprojectFile -eq $script:currentVProjectFile) {
-        Write-Log "Project unchanged ($vprojectFile) — no workspace swap needed"
         return
     }
 
@@ -607,8 +603,11 @@ foreach ($bufferedBytes in $pendingBuffer) {
         Write-Log "[helix→verse-lsp buffered flush] $bufferedJson"
 
         # If no restart occurred (workspace not found), try dynamic injection as a fallback.
-        if ($null -eq $script:currentVProjectFile -and $bufferedObj.method -eq 'textDocument/didOpen') {
-            Invoke-ProjectSwapIfNeeded -DocUri $bufferedObj.params.textDocument.uri -ChildIn $childIn
+        if ($null -eq $script:currentVProjectFile -and
+            $bufferedObj.method -like 'textDocument/*' -and
+            $bufferedObj.method -ne 'textDocument/didClose') {
+            $docUri = $bufferedObj.params.textDocument.uri
+            if ($docUri) { Invoke-ProjectSwapIfNeeded -DocUri $docUri -ChildIn $childIn }
         }
     } catch {
         Write-Log "Error processing buffered message: $_"
@@ -632,9 +631,9 @@ while ($true) {
         $jsonText = [System.Text.Encoding]::UTF8.GetString($bodyBytes)
         $obj = $jsonText | ConvertFrom-Json
 
-        if ($obj.method -eq 'textDocument/didOpen') {
+        if ($obj.method -like 'textDocument/*' -and $obj.method -ne 'textDocument/didClose') {
             $docUri = $obj.params.textDocument.uri
-            Invoke-ProjectSwapIfNeeded -DocUri $docUri -ChildIn $childIn
+            if ($docUri) { Invoke-ProjectSwapIfNeeded -DocUri $docUri -ChildIn $childIn }
 
         } elseif ($obj.method -eq 'shutdown') {
             # Close verse-lsp stdout so the background pump's ReadByte() returns -1
