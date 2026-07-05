@@ -34,7 +34,8 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$LogFile = "$env:TEMP\verse-lsp-wrapper.log"
+$LogFile    = "$env:TEMP\verse-lsp-wrapper.log"
+$VerboseLog = $false  # set to $true to enable full message body logging for debugging
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -42,6 +43,11 @@ function Write-Log {
     param([string]$Message)
     $ts = Get-Date -Format 'HH:mm:ss.fff'
     "[$ts] $Message" | Out-File -FilePath $LogFile -Append -Encoding utf8
+}
+
+function Write-VerboseLog {
+    param([string]$Message)
+    if ($script:VerboseLog) { Write-Log $Message }
 }
 
 Write-Log "verse-lsp-wrapper starting. LspBin=$LspBin"
@@ -78,16 +84,16 @@ function Find-VProjectFile {
             $projectName = [IO.Path]::GetFileNameWithoutExtension($uefn[0].Name)
             $vp = Join-Path $env:LOCALAPPDATA "UnrealEditorFortnite\Saved\VerseProject\$projectName\vproject\$projectName.vproject"
             if (Test-Path $vp) {
-                Write-Log "Found vproject for '$projectName': $vp"
+                Write-VerboseLog "Found vproject for '$projectName': $vp"
                 return $vp
             }
-            Write-Log "Found .uefnproject '$projectName' but no AppData vproject at: $vp"
+            Write-Log "WARNING: Found .uefnproject '$projectName' but no AppData vproject at: $vp"
         }
         $parent = [IO.Path]::GetDirectoryName($dir)
         if (-not $parent -or $parent -eq $dir) { break }
         $dir = $parent
     }
-    Write-Log "No .uefnproject found walking up from: $StartDir"
+    Write-VerboseLog "No .uefnproject found walking up from: $StartDir"
     return $null
 }
 
@@ -117,8 +123,8 @@ function Build-WorkspaceFolders {
         })
     }
 
-    Write-Log "Built $($folders.Count) workspace folders:"
-    foreach ($f in $folders) { Write-Log "  $($f.uri)" }
+    Write-VerboseLog "Built $($folders.Count) workspace folders:"
+    foreach ($f in $folders) { Write-VerboseLog "  $($f.uri)" }
     return $folders
 }
 
@@ -217,10 +223,12 @@ function Start-ForwardRunspace {
     $rs.SessionStateProxy.SetVariable('src', $Src)
     $rs.SessionStateProxy.SetVariable('dst', $Dst)
     $rs.SessionStateProxy.SetVariable('logPath', $LogPath)
+    $rs.SessionStateProxy.SetVariable('verboseLog', $VerboseLog)
     $ps = [System.Management.Automation.PowerShell]::Create()
     $ps.Runspace = $rs
     [void]$ps.AddScript(@'
         function FwdLog([string]$m) {
+            if (-not $verboseLog) { return }
             $ts = (Get-Date -Format 'HH:mm:ss.fff')
             "[$ts] [verse-lsp→helix] $m" | Out-File -FilePath $logPath -Append -Encoding utf8
         }
@@ -262,7 +270,11 @@ function Start-ForwardRunspace {
                 $dst.Write($hdrBytes, 0, $hdrBytes.Length)
                 $dst.Write($body, 0, $body.Length)
                 $dst.Flush()
-            } catch { FwdLog "ERROR: $_"; break }
+            } catch {
+                $ts = (Get-Date -Format 'HH:mm:ss.fff')
+                "[$ts] [verse-lsp→helix] ERROR: $_" | Out-File -FilePath $logPath -Append -Encoding utf8
+                break
+            }
         }
 '@)
     [void]$ps.BeginInvoke()
@@ -308,7 +320,7 @@ function Invoke-ProjectSwapIfNeeded {
         return
     }
 
-    Write-Log "Project changed: '$($script:currentVProjectFile)' → '$vprojectFile'"
+    Write-Log "Project changed: '$([IO.Path]::GetFileNameWithoutExtension($script:currentVProjectFile))' → '$([IO.Path]::GetFileNameWithoutExtension($vprojectFile))'"
     $newFolders = Build-WorkspaceFolders $vprojectFile
 
     $changeNotif = [PSCustomObject]@{
@@ -323,18 +335,18 @@ function Invoke-ProjectSwapIfNeeded {
     }
     $changeJson  = $changeNotif | ConvertTo-Json -Depth 20 -Compress
     $changeBytes = [System.Text.Encoding]::UTF8.GetBytes($changeJson)
-    Write-Log "Sending workspace/didChangeWorkspaceFolders: $changeJson"
+    Write-VerboseLog "Sending workspace/didChangeWorkspaceFolders: $changeJson"
     Send-LspMessage $ChildIn $changeBytes
 
     $script:currentVProjectFile = $vprojectFile
     $script:currentFolders      = $newFolders
-    Write-Log "Workspace swap complete — $($newFolders.Count) folders now active"
+    Write-Log "Workspace swap complete — $($newFolders.Count) folders active"
 }
 
 # ── Init handshake (synchronous — background runspace not yet started) ────────
 
 # Step 1: Read 'initialize' from Helix, inject workspace folders, forward to verse-lsp.
-Write-Log "Waiting for initialize from Helix..."
+Write-VerboseLog "Waiting for initialize from Helix..."
 $initMsg = Read-LspMessage $helixIn
 if ($null -eq $initMsg) {
     Write-Log "ERROR: Helix closed stdin before sending initialize"
@@ -345,13 +357,13 @@ $initBodyBytes = $initMsg.Body
 try {
     $initJson = [System.Text.Encoding]::UTF8.GetString($initBodyBytes)
     $initObj  = $initJson | ConvertFrom-Json
-    Write-Log "Intercepted initialize. rootUri=$($initObj.params.rootUri)"
+    Write-Log "initialize: rootUri=$($initObj.params.rootUri)"
 
     $rootUri  = $initObj.params.rootUri
     $startDir = if ($rootUri) { ConvertFrom-FileUri $rootUri } else { $null }
 
     if ($startDir) {
-        Write-Log "Walking up from: $startDir"
+        Write-VerboseLog "Walking up from: $startDir"
         $vprojectFile = Find-VProjectFile $startDir
         if ($vprojectFile) {
             $folders = Build-WorkspaceFolders $vprojectFile
@@ -365,7 +377,7 @@ try {
             $initBodyBytes = [System.Text.Encoding]::UTF8.GetBytes(($initObj | ConvertTo-Json -Depth 20 -Compress))
             $script:currentVProjectFile = $vprojectFile
             $script:currentFolders      = $folders
-            Write-Log "Injected $($folders.Count) workspace folders into initialize"
+            Write-Log "Injected $($folders.Count) workspace folders into initialize for '$([IO.Path]::GetFileNameWithoutExtension($vprojectFile))'"
         } else {
             Write-Log "No vproject found from rootUri — will inject at textDocument/didOpen"
         }
@@ -373,48 +385,48 @@ try {
         Write-Log "rootUri is null — will inject workspace folders at textDocument/didOpen"
     }
 } catch {
-    Write-Log "Error processing initialize: $_ — forwarding unchanged"
+    Write-Log "ERROR processing initialize: $_ — forwarding unchanged"
 }
 
 Send-LspMessage $childIn $initBodyBytes
-Write-Log "Forwarded initialize to verse-lsp"
+Write-VerboseLog "Forwarded initialize to verse-lsp"
 
 # Step 2: Read 'initializeResult' from verse-lsp, log capabilities, forward to Helix.
-Write-Log "Waiting for initializeResult from verse-lsp..."
+Write-VerboseLog "Waiting for initializeResult from verse-lsp..."
 $initResult = Read-LspMessage $childOut
 if ($null -eq $initResult) {
     Write-Log "ERROR: verse-lsp closed stdout before sending initializeResult"
     exit 1
 }
 $initResultJson = [System.Text.Encoding]::UTF8.GetString($initResult.Body)
-Write-Log "initializeResult: $initResultJson"
+Write-VerboseLog "initializeResult: $initResultJson"
 try {
     $initResultObj = $initResultJson | ConvertFrom-Json
     $wfCap = $initResultObj.result.capabilities.workspace.workspaceFolders
-    Write-Log "workspace.workspaceFolders capability: supported=$($wfCap.supported) changeNotifications=$($wfCap.changeNotifications)"
+    Write-Log "workspace.workspaceFolders: supported=$($wfCap.supported) changeNotifications=$($wfCap.changeNotifications)"
 } catch {
-    Write-Log "Could not parse workspace.workspaceFolders capability: $_"
+    Write-Log "WARNING: Could not parse workspace.workspaceFolders capability: $_"
 }
 
 Send-LspMessage $helixOut $initResult.Body
-Write-Log "Forwarded initializeResult to Helix"
+Write-VerboseLog "Forwarded initializeResult to Helix"
 
 # Step 3: Read 'initialized' from Helix, forward to verse-lsp.
-Write-Log "Waiting for initialized from Helix..."
+Write-VerboseLog "Waiting for initialized from Helix..."
 $initializedMsg = Read-LspMessage $helixIn
 if ($null -eq $initializedMsg) {
     Write-Log "ERROR: Helix closed stdin before sending initialized"
     exit 1
 }
 Send-LspMessage $childIn $initializedMsg.Body
-Write-Log "Forwarded initialized to verse-lsp"
+Write-VerboseLog "Forwarded initialized to verse-lsp"
 
 # Step 4: Synchronously drain server→client requests after 'initialized'.
 # verse-lsp sends client/registerCapability before Helix ACKs it.
 # Helix's send order is: initialized → textDocument/didOpen → registerCapability ACK.
 # So we must buffer any non-ACK Helix messages until the real ACK arrives, then
 # process the buffer (which triggers workspace injection for any buffered didOpen).
-Write-Log "Draining server→client requests synchronously..."
+Write-VerboseLog "Draining server→client requests synchronously..."
 
 $pendingBuffer = [System.Collections.Generic.List[byte[]]]::new()
 $draining      = $true
@@ -428,7 +440,7 @@ while ($draining) {
         exit 1
     }
     $serverJson = [System.Text.Encoding]::UTF8.GetString($serverMsg.Body)
-    Write-Log "[verse-lsp→helix sync] $serverJson"
+    Write-VerboseLog "[verse-lsp→helix sync] $serverJson"
     Send-LspMessage $helixOut $serverMsg.Body
     $drainCount++
 
@@ -436,7 +448,7 @@ while ($draining) {
         $serverObj = $serverJson | ConvertFrom-Json
 
         if ($serverObj.method -eq 'client/registerCapability') {
-            Write-Log "Intercepted client/registerCapability (id=$($serverObj.id)) — buffering Helix messages until ACK"
+            Write-VerboseLog "Intercepted client/registerCapability (id=$($serverObj.id)) — buffering Helix messages until ACK"
             $regCapId = $serverObj.id
 
             # Inner loop: buffer non-ACK Helix messages until the real ACK arrives.
@@ -454,13 +466,13 @@ while ($draining) {
                 $hasMethod     = ($helixObj | Get-Member 'method' -MemberType NoteProperty -ErrorAction SilentlyContinue) -ne $null
 
                 if ($hasMatchingId -and -not $hasMethod) {
-                    Write-Log "[helix→verse-lsp sync ACK] $helixJson"
+                    Write-VerboseLog "[helix→verse-lsp sync ACK] $helixJson"
                     Send-LspMessage $childIn $helixMsg.Body
-                    Write-Log "registerCapability ACK confirmed — drain complete"
+                    Write-VerboseLog "registerCapability ACK confirmed — drain complete"
                     $draining = $false
                     break
                 } else {
-                    Write-Log "[helix→verse-lsp buffered] $helixJson"
+                    Write-VerboseLog "[helix→verse-lsp buffered] $helixJson"
                     $pendingBuffer.Add($helixMsg.Body)
                 }
             }
@@ -470,7 +482,7 @@ while ($draining) {
         }
         # Notifications (no id) and other messages: forward already done above, keep draining.
     } catch {
-        Write-Log "Error parsing server message during drain: $_ — proceeding"
+        Write-Log "ERROR parsing server message during drain: $_ — proceeding"
         $draining = $false
     }
 }
@@ -504,13 +516,13 @@ if ($null -eq $script:currentVProjectFile) {
     }
 
     if ($restartVProject) {
-        Write-Log "Restarting verse-lsp with $($restartFolders.Count) workspace folders..."
+        Write-Log "Restarting verse-lsp with $($restartFolders.Count) workspace folders for '$([IO.Path]::GetFileNameWithoutExtension($restartVProject))'..."
 
         # Kill the first verse-lsp instance (it has no workspace).
         try { $childIn.Close() }  catch {}
         try { $childOut.Close() } catch {}
         try { if (-not $child.HasExited) { $child.Kill() } } catch {}
-        Write-Log "Old verse-lsp (PID=$($child.Id)) terminated"
+        Write-VerboseLog "Old verse-lsp (PID=$($child.Id)) terminated"
 
         # Start a fresh verse-lsp instance.
         $psi2 = [System.Diagnostics.ProcessStartInfo]::new($LspBin)
@@ -520,7 +532,7 @@ if ($null -eq $script:currentVProjectFile) {
         $child = [System.Diagnostics.Process]::new()
         $child.StartInfo = $psi2
         [void]$child.Start()
-        Write-Log "New verse-lsp started PID=$($child.Id)"
+        Write-VerboseLog "New verse-lsp started PID=$($child.Id)"
 
         $childIn  = $child.StandardInput.BaseStream
         $childOut = $child.StandardOutput.BaseStream
@@ -533,7 +545,7 @@ if ($null -eq $script:currentVProjectFile) {
         }
         $initBytes2 = [System.Text.Encoding]::UTF8.GetBytes(($initObj | ConvertTo-Json -Depth 20 -Compress))
         Send-LspMessage $childIn $initBytes2
-        Write-Log "Sent initialize (with workspace folders) to new verse-lsp"
+        Write-VerboseLog "Sent initialize (with workspace folders) to new verse-lsp"
 
         # Read and discard initializeResult — Helix already has it from instance 1.
         $initResult2 = Read-LspMessage $childOut
@@ -541,12 +553,12 @@ if ($null -eq $script:currentVProjectFile) {
             Write-Log "ERROR: new verse-lsp closed stdout before sending initializeResult"
             exit 1
         }
-        Write-Log "Received initializeResult from new verse-lsp (discarding — Helix already has it)"
+        Write-VerboseLog "Received initializeResult from new verse-lsp (discarding — Helix already has it)"
 
         # Send 'initialized' — Helix already sent this; replay it internally.
         $initNotifBytes = [System.Text.Encoding]::UTF8.GetBytes('{"jsonrpc":"2.0","method":"initialized","params":{}}')
         Send-LspMessage $childIn $initNotifBytes
-        Write-Log "Sent initialized to new verse-lsp"
+        Write-VerboseLog "Sent initialized to new verse-lsp"
 
         # Drain new verse-lsp's post-init requests. Handle client/registerCapability
         # internally (Helix already ACKed it for instance 1, don't send again).
@@ -559,7 +571,7 @@ if ($null -eq $script:currentVProjectFile) {
                 exit 1
             }
             $sJson = [System.Text.Encoding]::UTF8.GetString($sMsg.Body)
-            Write-Log "[new verse-lsp internal drain] $sJson"
+            Write-VerboseLog "[new verse-lsp internal drain] $sJson"
             $internalDrainCount++
 
             try {
@@ -568,15 +580,14 @@ if ($null -eq $script:currentVProjectFile) {
                     $ackBytes2 = [System.Text.Encoding]::UTF8.GetBytes(
                         "{`"jsonrpc`":`"2.0`",`"id`":$($sObj.id),`"result`":null}")
                     Send-LspMessage $childIn $ackBytes2
-                    Write-Log "Internally ACKed client/registerCapability (id=$($sObj.id)) — restart complete"
+                    Write-Log "Internally ACKed client/registerCapability — restart complete"
                     $internalDraining = $false
                 } elseif ($internalDrainCount -ge 20) {
                     Write-Log "WARNING: internal drain safety valve — proceeding"
                     $internalDraining = $false
                 }
-                # Other notifications: already logged, just keep draining.
             } catch {
-                Write-Log "Error in internal drain: $_ — proceeding"
+                Write-Log "ERROR in internal drain: $_ — proceeding"
                 $internalDraining = $false
             }
         }
@@ -591,16 +602,16 @@ if ($null -eq $script:currentVProjectFile) {
 
 # Step 6: Start background byte pump for all subsequent verse-lsp → Helix traffic.
 $fwdPs = Start-ForwardRunspace -Src $childOut -Dst $helixOut -LogPath $LogFile
-Write-Log "Stdout-forward runspace started"
+Write-VerboseLog "Stdout-forward runspace started"
 
 # ── Flush buffered Helix messages to verse-lsp ────────────────────────────────
 
-Write-Log "Flushing $($pendingBuffer.Count) buffered message(s) to verse-lsp..."
+Write-VerboseLog "Flushing $($pendingBuffer.Count) buffered message(s) to verse-lsp..."
 foreach ($bufferedBytes in $pendingBuffer) {
     try {
         $bufferedJson = [System.Text.Encoding]::UTF8.GetString($bufferedBytes)
         $bufferedObj  = $bufferedJson | ConvertFrom-Json
-        Write-Log "[helix→verse-lsp buffered flush] $bufferedJson"
+        Write-VerboseLog "[helix→verse-lsp buffered flush] $bufferedJson"
 
         # If no restart occurred (workspace not found), try dynamic injection as a fallback.
         if ($null -eq $script:currentVProjectFile -and
@@ -610,7 +621,7 @@ foreach ($bufferedBytes in $pendingBuffer) {
             if ($docUri) { Invoke-ProjectSwapIfNeeded -DocUri $docUri -ChildIn $childIn }
         }
     } catch {
-        Write-Log "Error processing buffered message: $_"
+        Write-Log "ERROR processing buffered message: $_"
     }
     Send-LspMessage $childIn $bufferedBytes
 }
@@ -658,7 +669,7 @@ while ($true) {
     }
 
     if (-not $forwarded) {
-        Write-Log "[helix→verse-lsp] $jsonText"
+        Write-VerboseLog "[helix→verse-lsp] $jsonText"
         Send-LspMessage $childIn $bodyBytes
     }
 }
